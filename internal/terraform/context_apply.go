@@ -10,7 +10,9 @@ import (
 	"github.com/zclconf/go-cty/cty"
 
 	"github.com/hashicorp/terraform/internal/addrs"
+	"github.com/hashicorp/terraform/internal/collections"
 	"github.com/hashicorp/terraform/internal/configs"
+	"github.com/hashicorp/terraform/internal/lang"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/states"
@@ -27,6 +29,16 @@ type ApplyOpts struct {
 	// the providers that were passed when creating the plan that's being
 	// applied, or the results will be erratic.
 	ExternalProviders map[addrs.RootProviderConfig]providers.Interface
+
+	// SetVariables are the raw values for root module variables as provided
+	// by the user who is requesting the run, prior to any normalization or
+	// substitution of defaults. See the documentation for the InputValue
+	// type for more information on how to correctly populate this.
+	//
+	// During the apply phase it's only valid to specify values for input
+	// values that were declared as ephemeral, because all other input
+	// values must retain the values that were specified during planning.
+	SetVariables InputValues
 }
 
 // ApplyOpts creates an [ApplyOpts] with copies of all of the elements that
@@ -59,6 +71,20 @@ func (po *PlanOpts) ApplyOpts() *ApplyOpts {
 // settings during apply, so leaving opts as nil might not be valid for
 // certain combinations of plan-time options.
 func (c *Context) Apply(plan *plans.Plan, config *configs.Config, opts *ApplyOpts) (*states.State, tfdiags.Diagnostics) {
+	state, _, diags := c.ApplyAndEval(plan, config, opts)
+	return state, diags
+}
+
+// ApplyAndEval is like [Context.Apply] except that it additionally makes a
+// best effort to return a [lang.Scope] which can evaluate expressions in the
+// root module based on the content of the new state.
+//
+// The scope will be nil if the apply process doesn't complete successfully
+// enough to produce a valid evaluation scope. If the returned state is nil
+// then the scope will always be nil, but it's also possible for the scope
+// to be nil even when the state isn't, if the apply didn't complete enough for
+// the evaluation scope to produce consistent results.
+func (c *Context) ApplyAndEval(plan *plans.Plan, config *configs.Config, opts *ApplyOpts) (*states.State, *lang.Scope, tfdiags.Diagnostics) {
 	defer c.acquireRun("apply")()
 	var diags tfdiags.Diagnostics
 
@@ -72,24 +98,60 @@ func (c *Context) Apply(plan *plans.Plan, config *configs.Config, opts *ApplyOpt
 	}
 
 	if plan.Errored {
-		var diags tfdiags.Diagnostics
 		diags = diags.Append(tfdiags.Sourceless(
 			tfdiags.Error,
 			"Cannot apply failed plan",
 			`The given plan is incomplete due to errors during planning, and so it cannot be applied.`,
 		))
-		return nil, diags
+		return nil, nil, diags
+	}
+	if !plan.Applyable {
+		if plan.Changes.Empty() {
+			// If a plan is not applyable but it didn't have any errors then that
+			// suggests it was a "no-op" plan, which doesn't really do any
+			// harm to apply, so we'll just do it but leave ourselves a note
+			// in the trace log in case it ends up relevant to a bug report.
+			log.Printf("[TRACE] Applying a no-op plan")
+		} else {
+			// This situation isn't something we expect, since our own rules
+			// for what "applyable" means make this scenario impossible. We'll
+			// reject it on the assumption that something very strange is
+			// going on. and so better to halt than do something incorrect.
+			// This error message is generic and useless because we don't
+			// expect anyone to ever see it in normal use.
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Cannot apply non-applyable plan",
+				`The given plan is not applyable. If this seems like a bug in Terraform, then please report it!`,
+			))
+			return nil, nil, diags
+		}
+	}
+
+	// The caller must provide values for all of the "apply-time variables"
+	// mentioned in the plan, and for no others because the others come from
+	// the plan itself.
+	diags = diags.Append(checkApplyTimeVariables(plan.ApplyTimeVariables, opts.SetVariables, config))
+
+	if diags.HasErrors() {
+		// If the apply request is invalid in some way then we'll bail out
+		// here before we do any real work.
+		return nil, nil, diags
 	}
 
 	for _, rc := range plan.Changes.Resources {
 		// Import is a no-op change during an apply (all the real action happens during the plan) but we'd
 		// like to show some helpful output that mirrors the way we show other changes.
 		if rc.Importing != nil {
+			hookResourceID := HookResourceIdentity{
+				Addr:         rc.Addr,
+				ProviderAddr: rc.ProviderAddr.Provider,
+			}
 			for _, h := range c.hooks {
 				// In future, we may need to call PostApplyImport separately elsewhere in the apply
 				// operation. For now, though, we'll call Pre and Post hooks together.
-				h.PreApplyImport(rc.Addr, *rc.Importing)
-				h.PostApplyImport(rc.Addr, *rc.Importing)
+				h.PreApplyImport(hookResourceID, *rc.Importing)
+				h.PostApplyImport(hookResourceID, *rc.Importing)
 			}
 		}
 	}
@@ -97,22 +159,36 @@ func (c *Context) Apply(plan *plans.Plan, config *configs.Config, opts *ApplyOpt
 	graph, operation, moreDiags := c.applyGraph(plan, config, opts, true)
 	diags = diags.Append(moreDiags)
 	if moreDiags.HasErrors() {
-		return nil, diags
+		return nil, nil, diags
 	}
 
-	moreDiags = checkExternalProviders(config, opts.ExternalProviders)
+	moreDiags = checkExternalProviders(config, plan, nil, opts.ExternalProviders)
 	diags = diags.Append(moreDiags)
 	if moreDiags.HasErrors() {
-		return nil, diags
+		return nil, nil, diags
+	}
+
+	schemas, schemaDiags := c.Schemas(config, plan.PriorState)
+	diags = diags.Append(schemaDiags)
+	if diags.HasErrors() {
+		return nil, nil, diags
+	}
+
+	changes, err := plan.Changes.Decode(schemas)
+	if err != nil {
+		diags = diags.Append(err)
+		return nil, nil, diags
 	}
 
 	workingState := plan.PriorState.DeepCopy()
 	walker, walkDiags := c.walk(graph, operation, &graphWalkOpts{
 		Config:                  config,
 		InputState:              workingState,
-		Changes:                 plan.Changes,
+		Changes:                 changes,
 		Overrides:               plan.Overrides,
 		ExternalProviderConfigs: opts.ExternalProviders,
+
+		DeferralAllowed: true,
 
 		// We need to propagate the check results from the plan phase,
 		// because that will tell us which checkable objects we're expecting
@@ -121,6 +197,8 @@ func (c *Context) Apply(plan *plans.Plan, config *configs.Config, opts *ApplyOpt
 
 		// We also want to propagate the timestamp from the plan file.
 		PlanTimeTimestamp: plan.Timestamp,
+
+		ProviderFuncResults: providers.NewFunctionResultsTable(plan.ProviderFunctionResults),
 	})
 	diags = diags.Append(walker.NonFatalDiagnostics)
 	diags = diags.Append(walkDiags)
@@ -145,7 +223,7 @@ func (c *Context) Apply(plan *plans.Plan, config *configs.Config, opts *ApplyOpt
 			"Applied changes may be incomplete",
 			`The plan was created with the -target option in effect, so some changes requested in the configuration may have been ignored and the output values may not be fully updated. Run the following command to verify that no other changes are pending:
     terraform plan
-	
+
 Note that the -target option is not suitable for routine use, and is provided only for exceptional situations such as recovering from errors or mistakes, or when Terraform specifically suggests to use it as part of an error message.`,
 		))
 	}
@@ -165,7 +243,50 @@ Note that the -target option is not suitable for routine use, and is provided on
 		newState.CheckResults = plan.Checks.DeepCopy()
 	}
 
-	return newState, diags
+	// The caller also gets access to an expression evaluation scope in the
+	// root module, in case it needs to extract other information using
+	// expressions, like in "terraform console" or the test harness.
+	evalScope := evalScopeFromGraphWalk(walker, addrs.RootModuleInstance)
+
+	return newState, evalScope, diags
+}
+
+func checkApplyTimeVariables(needed collections.Set[string], gotValues InputValues, config *configs.Config) tfdiags.Diagnostics {
+	var diags tfdiags.Diagnostics
+	for name := range needed.All() {
+		if vv, exists := gotValues[name]; !exists || vv.Value == cty.NilVal || vv.Value.IsNull() {
+			// This error message assumes that the only possible reason for
+			// an apply-time variable is because the variable is ephemeral,
+			// which is true at the time of writing. This error message might
+			// need to be generalized if we introduce other reasons for
+			// apply-time variables in future.
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"No value for required variable",
+				fmt.Sprintf("The ephemeral input variable %q was set during the plan phase, and so must also be set during the apply phase.", name),
+			))
+		}
+	}
+	for name := range gotValues {
+		if !needed.Has(name) {
+			// We'll treat this a little differently depending on whether
+			// the variable is declared as ephemeral or not.
+			if vc, ok := config.Module.Variables[name]; ok && vc.Ephemeral {
+				diags = diags.Append(tfdiags.Sourceless(
+					tfdiags.Error,
+					"No value for required variable",
+					fmt.Sprintf("The ephemeral input variable %q was not set during the plan phase, and so must remain unset during the apply phase.", name),
+				))
+			} else {
+				diags = diags.Append(tfdiags.Sourceless(
+					tfdiags.Error,
+					"Unexpected new value for variable",
+					fmt.Sprintf("Input variable %q is non-ephemeral, so its value was fixed during planning and cannot be reset during apply.", name),
+				))
+			}
+		}
+	}
+	return diags
 }
 
 func (c *Context) applyGraph(plan *plans.Plan, config *configs.Config, opts *ApplyOpts, validate bool) (*Graph, walkOperation, tfdiags.Diagnostics) {
@@ -182,10 +303,22 @@ func (c *Context) applyGraph(plan *plans.Plan, config *configs.Config, opts *App
 			))
 			continue
 		}
+		if pvm, ok := plan.VariableMarks[name]; ok {
+			val = val.MarkWithPaths(pvm)
+		}
 
 		variables[name] = &InputValue{
 			Value:      val,
 			SourceType: ValueFromPlan,
+		}
+	}
+	// Apply-time variables need to be merged in too.
+	// FIXME: We should check that all of these match declared variables and
+	// that all of them are declared as ephemeral, because all non-ephemeral
+	// variables are supposed to come exclusively from plan.VariableValues.
+	if opts != nil {
+		for n, vv := range opts.SetVariables {
+			variables[n] = vv
 		}
 	}
 	if diags.HasErrors() {
@@ -219,16 +352,25 @@ func (c *Context) applyGraph(plan *plans.Plan, config *configs.Config, opts *App
 		operation = walkDestroy
 	}
 
+	var externalProviderConfigs map[addrs.RootProviderConfig]providers.Interface
+	if opts != nil {
+		externalProviderConfigs = opts.ExternalProviders
+	}
+
 	graph, moreDiags := (&ApplyGraphBuilder{
-		Config:             config,
-		Changes:            plan.Changes,
-		State:              plan.PriorState,
-		RootVariableValues: variables,
-		Plugins:            c.plugins,
-		Targets:            plan.TargetAddrs,
-		ForceReplace:       plan.ForceReplaceAddrs,
-		Operation:          operation,
-		ExternalReferences: plan.ExternalReferences,
+		Config:                  config,
+		Changes:                 plan.Changes,
+		DeferredChanges:         plan.DeferredResources,
+		State:                   plan.PriorState,
+		RootVariableValues:      variables,
+		ExternalProviderConfigs: externalProviderConfigs,
+		Plugins:                 c.plugins,
+		Targets:                 plan.TargetAddrs,
+		ForceReplace:            plan.ForceReplaceAddrs,
+		Operation:               operation,
+		ExternalReferences:      plan.ExternalReferences,
+		Overrides:               plan.Overrides,
+		SkipGraphValidation:     c.graphOpts.SkipGraphValidation,
 	}).Build(addrs.RootModuleInstance)
 	diags = diags.Append(moreDiags)
 	if moreDiags.HasErrors() {

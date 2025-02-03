@@ -6,18 +6,23 @@ package stackeval
 import (
 	"context"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 
 	"github.com/hashicorp/go-slug/sourceaddrs"
 	"github.com/hashicorp/go-slug/sourcebundle"
+	"github.com/zclconf/go-cty/cty"
+	"google.golang.org/protobuf/reflect/protoreflect"
+	"google.golang.org/protobuf/types/known/anypb"
+
+	_ "github.com/hashicorp/terraform/internal/logging"
 	"github.com/hashicorp/terraform/internal/promising"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/stacks/stackconfig"
+	"github.com/hashicorp/terraform/internal/stacks/stackplan"
 	"github.com/hashicorp/terraform/internal/stacks/stackstate"
-	"github.com/hashicorp/terraform/internal/stacks/stackstate/statekeys"
 	"github.com/hashicorp/terraform/internal/tfdiags"
-	"github.com/zclconf/go-cty/cty"
-	"google.golang.org/protobuf/reflect/protoreflect"
 )
 
 // This file contains some general test utilities that many of our other
@@ -45,7 +50,8 @@ func testStackConfig(t *testing.T, collection string, subPath string) *stackconf
 	sources := testSourceBundle(t)
 	ret, diags := stackconfig.LoadConfigDir(fakeSrc, sources)
 	if diags.HasErrors() {
-		t.Fatalf("configuration is invalid\n%s", diags.Err().Error())
+		diags.Sort()
+		t.Fatalf("configuration is invalid\n%s", testFormatDiagnostics(t, diags))
 	}
 	return ret
 }
@@ -66,13 +72,267 @@ func testSourceBundle(t *testing.T) *sourcebundle.Bundle {
 	return sources
 }
 
-func testPriorState(t *testing.T, msgs map[statekeys.Key]protoreflect.ProtoMessage) *stackstate.State {
+func testPriorState(t *testing.T, msgs map[string]protoreflect.ProtoMessage) *stackstate.State {
 	t.Helper()
 	ret, err := stackstate.LoadFromDirectProto(msgs)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return ret
+}
+
+func testPlan(t *testing.T, main *Main) (*stackplan.Plan, tfdiags.Diagnostics) {
+	t.Helper()
+	outp, outpTest := testPlanOutput(t)
+	main.PlanAll(context.Background(), outp)
+	return outpTest.Close(t)
+}
+
+func testPlanOutput(t *testing.T) (PlanOutput, *planOutputTester) {
+	t.Helper()
+	tester := &planOutputTester{}
+	outp := PlanOutput{
+		AnnouncePlannedChange: func(ctx context.Context, pc stackplan.PlannedChange) {
+			tester.mu.Lock()
+			tester.planned = append(tester.planned, pc)
+			tester.mu.Unlock()
+		},
+		AnnounceDiagnostics: func(ctx context.Context, d tfdiags.Diagnostics) {
+			tester.mu.Lock()
+			tester.diags = tester.diags.Append(d)
+			tester.mu.Unlock()
+		},
+	}
+	return outp, tester
+}
+
+type planOutputTester struct {
+	planned []stackplan.PlannedChange
+	diags   tfdiags.Diagnostics
+	mu      sync.Mutex
+}
+
+// PlannedChanges returns the planned changes that have been accumulated in the
+// receiver.
+//
+// It isn't safe to access the returned slice concurrently with a planning
+// operation. Use this method only once the plan operation is complete and
+// thus the changes are finalized.
+func (pot *planOutputTester) PlannedChanges() []stackplan.PlannedChange {
+	return pot.planned
+}
+
+// RawChanges returns the protobuf representation changes that have been
+// accumulated in the receiver.
+//
+// It isn't safe to call this method concurrently with a planning
+// operation. Use this method only once the plan operation is complete and
+// thus the raw changes are finalized.
+func (pot *planOutputTester) RawChanges(t *testing.T) []*anypb.Any {
+	t.Helper()
+
+	var msgs []*anypb.Any
+	for _, change := range pot.planned {
+		protoChange, err := change.PlannedChangeProto()
+		if err != nil {
+			t.Fatalf("failed to encode %T: %s", change, err)
+		}
+		msgs = append(msgs, protoChange.Raw...)
+	}
+
+	// Normally it's the stackeval caller (in stackruntime) that marks a
+	// plan as "applyable", but since we're calling into the stackeval functions
+	// directly here we'll need to add that extra item ourselves.
+	if !pot.diags.HasErrors() {
+		change := stackplan.PlannedChangeApplyable{
+			Applyable: true,
+		}
+		protoChange, err := change.PlannedChangeProto()
+		if err != nil {
+			t.Fatalf("failed to encode %T: %s", change, err)
+		}
+		msgs = append(msgs, protoChange.Raw...)
+	}
+
+	return msgs
+}
+
+// Diags returns the diagnostics that have been accumulated in the
+// receiver.
+//
+// It isn't safe to access the returned slice concurrently with a planning
+// operation. Use this method only once the plan operation is complete and
+// thus the diagnostics are finalized.
+func (pot *planOutputTester) Diags() tfdiags.Diagnostics {
+	return pot.diags
+}
+
+func (pot *planOutputTester) Close(t *testing.T) (*stackplan.Plan, tfdiags.Diagnostics) {
+	t.Helper()
+
+	// Caller shouldn't close concurrently with other work anyway, but we'll
+	// include this just to help make things behave more consistently even when
+	// the caller is buggy.
+	pot.mu.Lock()
+	defer pot.mu.Unlock()
+
+	// We'll now round-trip all of the planned changes through the serialize
+	// and deserialize logic to approximate the effect of this plan having been
+	// saved and then reloaded during a subsequent apply phase, since
+	// the reloaded plan is a more convenient artifact to inspect in tests.
+	msgs := pot.RawChanges(t)
+	plan, err := stackplan.LoadFromProto(msgs)
+	if err != nil {
+		t.Fatalf("failed to reload saved plan: %s", err)
+	}
+	return plan, pot.diags
+}
+
+func testApplyOutput(t *testing.T, priorStateRaw map[string]*anypb.Any) (ApplyOutput, *applyOutputTester) {
+	t.Helper()
+	tester := &applyOutputTester{}
+	outp := ApplyOutput{
+		AnnounceAppliedChange: func(ctx context.Context, ac stackstate.AppliedChange) {
+			tester.mu.Lock()
+			tester.applied = append(tester.applied, ac)
+			tester.mu.Unlock()
+		},
+		AnnounceDiagnostics: func(ctx context.Context, d tfdiags.Diagnostics) {
+			tester.mu.Lock()
+			tester.diags = tester.diags.Append(d)
+			tester.mu.Unlock()
+		},
+	}
+	return outp, tester
+}
+
+type applyOutputTester struct {
+	prior   map[string]*anypb.Any
+	applied []stackstate.AppliedChange
+	diags   tfdiags.Diagnostics
+	mu      sync.Mutex
+}
+
+// AppliedChanges returns the applied change objects that have been accumulated
+// in the receiver.
+//
+// It isn't safe to access the returned slice concurrently with an apply
+// operation. Use this method only once the apply operation is complete and
+// thus the changes are finalized.
+func (aot *applyOutputTester) AppliedChanges() []stackstate.AppliedChange {
+	return aot.applied
+}
+
+// RawUpdatedState returns the protobuf representation of the state with the
+// accumulated changes merged into it.
+//
+// It isn't safe to call this method concurrently with an apply
+// operation. Use this method only once the apply operation is complete and
+// thus the changes are finalized.
+func (aot *applyOutputTester) RawUpdatedState(t *testing.T) map[string]*anypb.Any {
+	t.Helper()
+
+	msgs := make(map[string]*anypb.Any)
+	for k, v := range aot.prior {
+		msgs[k] = v
+	}
+	for _, change := range aot.applied {
+		protoChange, err := change.AppliedChangeProto()
+		if err != nil {
+			t.Fatalf("failed to encode %T: %s", change, err)
+		}
+		for _, protoRaw := range protoChange.Raw {
+			if protoRaw.Value != nil {
+				msgs[protoRaw.Key] = protoRaw.Value
+			} else {
+				delete(msgs, protoRaw.Key)
+			}
+		}
+	}
+
+	return msgs
+}
+
+// Diags returns the diagnostics that have been accumulated in the
+// receiver.
+//
+// It isn't safe to access the returned slice concurrently with an apply
+// operation. Use this method only once the apply operation is complete and
+// thus the diagnostics are finalized.
+func (aot *applyOutputTester) Diags() tfdiags.Diagnostics {
+	return aot.diags
+}
+
+func (aot *applyOutputTester) Close(t *testing.T) (*stackstate.State, tfdiags.Diagnostics) {
+	t.Helper()
+
+	// Caller shouldn't close concurrently with other work anyway, but we'll
+	// include this just to help make things behave more consistently even when
+	// the caller is buggy.
+	aot.mu.Lock()
+	defer aot.mu.Unlock()
+
+	// We'll now round-trip all of the applied changes through the serialize
+	// and deserialize logic to approximate the effect of this having having been
+	// saved and then reloaded during a subsequent planning phase.
+	msgs := aot.RawUpdatedState(t)
+	state, err := stackstate.LoadFromProto(msgs)
+	if err != nil {
+		t.Fatalf("failed to reload saved state: %s", err)
+	}
+	return state, aot.diags
+}
+
+func testFormatDiagnostics(t *testing.T, diags tfdiags.Diagnostics) string {
+	t.Helper()
+	var buf strings.Builder
+	for _, diag := range diags {
+		buf.WriteString(testFormatDiagnostic(t, diag))
+		buf.WriteByte('\n')
+	}
+	return buf.String()
+}
+
+func testFormatDiagnostic(t *testing.T, diag tfdiags.Diagnostic) string {
+	t.Helper()
+
+	var buf strings.Builder
+	switch diag.Severity() {
+	case tfdiags.Error:
+		buf.WriteString("[ERROR] ")
+	case tfdiags.Warning:
+		buf.WriteString("[WARNING] ")
+	default:
+		buf.WriteString("[PROBLEM] ")
+	}
+	desc := diag.Description()
+	buf.WriteString(desc.Summary)
+	buf.WriteByte('\n')
+	if subj := diag.Source().Subject; subj != nil {
+		buf.WriteString("at " + subj.StartString() + "\n")
+	}
+	if desc.Detail != "" {
+		buf.WriteByte('\n')
+		buf.WriteString(desc.Detail)
+		buf.WriteByte('\n')
+	}
+	return buf.String()
+}
+
+func assertNoDiagnostics(t *testing.T, diags tfdiags.Diagnostics) {
+	t.Helper()
+	if len(diags) != 0 {
+		diags.Sort()
+		t.Fatalf("unexpected diagnostics\n\n%s", testFormatDiagnostics(t, diags))
+	}
+}
+
+func assertNoErrors(t *testing.T, diags tfdiags.Diagnostics) {
+	t.Helper()
+	if diags.HasErrors() {
+		diags.Sort()
+		t.Fatalf("unexpected errors\n\n%s", testFormatDiagnostics(t, diags))
+	}
 }
 
 // testEvaluator constructs a [Main] that's configured for [InspectPhase] using
@@ -173,6 +433,20 @@ type testEvaluatorOpts struct {
 // other callers.
 func (m *Main) SetTestOnlyGlobals(t *testing.T, vals map[string]cty.Value) {
 	m.testOnlyGlobals = vals
+}
+
+func assertFalse(t *testing.T, value bool) {
+	t.Helper()
+	if value {
+		t.Fatalf("expected false but got true")
+	}
+}
+
+func assertTrue(t *testing.T, value bool) {
+	t.Helper()
+	if !value {
+		t.Fatalf("expected true but got false")
+	}
 }
 
 func assertNoDiags(t *testing.T, diags tfdiags.Diagnostics) {

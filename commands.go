@@ -8,11 +8,11 @@ import (
 	"os"
 	"os/signal"
 
+	"github.com/hashicorp/cli"
 	"github.com/hashicorp/go-plugin"
 	svchost "github.com/hashicorp/terraform-svchost"
 	"github.com/hashicorp/terraform-svchost/auth"
 	"github.com/hashicorp/terraform-svchost/disco"
-	"github.com/mitchellh/cli"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/command"
@@ -91,7 +91,7 @@ func initCommands(
 		View:       views.NewView(streams).SetRunningInAutomation(inAutomation),
 
 		Color:            true,
-		GlobalPluginDirs: globalPluginDirs(),
+		GlobalPluginDirs: cliconfig.GlobalPluginDirs(),
 		Ui:               Ui,
 
 		Services:        services,
@@ -224,6 +224,12 @@ func initCommands(
 
 		"metadata functions": func() (cli.Command, error) {
 			return &command.MetadataFunctionsCommand{
+				Meta: meta,
+			}, nil
+		},
+
+		"modules": func() (cli.Command, error) {
+			return &command.ModulesCommand{
 				Meta: meta,
 			}, nil
 		},
@@ -469,6 +475,6 @@ func makeShutdownCh() <-chan struct{} {
 }
 
 func credentialsSource(config *cliconfig.Config) (auth.CredentialsSource, error) {
-	helperPlugins := pluginDiscovery.FindPlugins("credentials", globalPluginDirs())
+	helperPlugins := pluginDiscovery.FindPlugins("credentials", cliconfig.GlobalPluginDirs())
 	return config.CredentialsSource(helperPlugins)
 }
