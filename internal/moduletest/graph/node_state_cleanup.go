@@ -24,6 +24,7 @@ var (
 type NodeStateCleanup struct {
 	stateKey string
 	opts     *graphOptions
+	parallel bool
 }
 
 func (n *NodeStateCleanup) Name() string {
@@ -80,7 +81,6 @@ func (n *NodeStateCleanup) Execute(evalCtx *EvalContext) {
 		// intentionally return nil to allow further cleanup
 		return
 	}
-	TransformConfigForRun(evalCtx, state.Run, file)
 
 	runNode := &NodeTestRun{run: state.Run, opts: n.opts}
 	updated := state.State
@@ -114,13 +114,15 @@ func (n *NodeStateCleanup) destroy(ctx *EvalContext, runNode *NodeTestRun, waite
 		return state, nil
 	}
 
-	var diags tfdiags.Diagnostics
-	variables, variableDiags := runNode.GetVariables(ctx, false)
-	diags = diags.Append(variableDiags)
-
+	variables, diags := runNode.GetVariables(ctx, false)
 	if diags.HasErrors() {
 		return state, diags
 	}
+
+	// we ignore the diagnostics from here, because we will have reported them
+	// during the initial execution of the run block and we would not have
+	// executed the run block if there were any errors.
+	providers, mocks, _ := runNode.getProviders(ctx)
 
 	// During the destroy operation, we don't add warnings from this operation.
 	// Anything that would have been reported here was already reported during
@@ -129,16 +131,13 @@ func (n *NodeStateCleanup) destroy(ctx *EvalContext, runNode *NodeTestRun, waite
 	setVariables, _, _ := runNode.FilterVariablesToModule(variables)
 
 	planOpts := &terraform.PlanOpts{
-		Mode:         plans.DestroyMode,
-		SetVariables: setVariables,
-		Overrides:    mocking.PackageOverrides(run.Config, file.Config, run.ModuleConfig),
+		Mode:              plans.DestroyMode,
+		SetVariables:      setVariables,
+		Overrides:         mocking.PackageOverrides(run.Config, file.Config, mocks),
+		ExternalProviders: providers,
 	}
 
-	tfCtx, ctxDiags := terraform.NewContext(n.opts.ContextOpts)
-	diags = diags.Append(ctxDiags)
-	if ctxDiags.HasErrors() {
-		return state, diags
-	}
+	tfCtx, _ := terraform.NewContext(n.opts.ContextOpts)
 	ctx.Renderer().Run(run, file, moduletest.TearDown, 0)
 
 	waiter.update(tfCtx, moduletest.TearDown, nil)
@@ -148,7 +147,7 @@ func (n *NodeStateCleanup) destroy(ctx *EvalContext, runNode *NodeTestRun, waite
 		return state, diags
 	}
 
-	_, updated, applyDiags := runNode.apply(tfCtx, plan, moduletest.TearDown, variables, waiter)
+	_, updated, applyDiags := runNode.apply(tfCtx, plan, moduletest.TearDown, variables, providers, waiter)
 	diags = diags.Append(applyDiags)
 	return updated, diags
 }

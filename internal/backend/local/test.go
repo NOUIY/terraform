@@ -15,11 +15,8 @@ import (
 	"github.com/hashicorp/terraform/internal/command/junit"
 	"github.com/hashicorp/terraform/internal/command/views"
 	"github.com/hashicorp/terraform/internal/configs"
-	"github.com/hashicorp/terraform/internal/dag"
-	"github.com/hashicorp/terraform/internal/logging"
 	"github.com/hashicorp/terraform/internal/moduletest"
 	"github.com/hashicorp/terraform/internal/moduletest/graph"
-	hcltest "github.com/hashicorp/terraform/internal/moduletest/hcl"
 	"github.com/hashicorp/terraform/internal/terraform"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
@@ -62,7 +59,6 @@ type TestSuiteRunner struct {
 	Verbose bool
 
 	Concurrency int
-	semaphore   terraform.Semaphore
 }
 
 func (runner *TestSuiteRunner) Stop() {
@@ -83,7 +79,6 @@ func (runner *TestSuiteRunner) Test() (moduletest.Status, tfdiags.Diagnostics) {
 	if runner.Concurrency < 1 {
 		runner.Concurrency = 10
 	}
-	runner.semaphore = terraform.NewSemaphore(runner.Concurrency)
 
 	suite, suiteDiags := runner.collectTests()
 	diags = diags.Append(suiteDiags)
@@ -103,7 +98,7 @@ func (runner *TestSuiteRunner) Test() (moduletest.Status, tfdiags.Diagnostics) {
 	// collisions, as the test directory variables should take precedence.
 	maps.Copy(testDirectoryGlobalVariables, runner.GlobalTestVariables)
 
-	suite.Status = moduletest.Pass
+	suite.Status = moduletest.Pending
 	for _, name := range slices.Sorted(maps.Keys(suite.Files)) {
 		if runner.Cancelled {
 			return suite.Status, diags
@@ -119,19 +114,13 @@ func (runner *TestSuiteRunner) Test() (moduletest.Status, tfdiags.Diagnostics) {
 		}
 
 		evalCtx := graph.NewEvalContext(graph.EvalContextOpts{
-			CancelCtx: runner.CancelledCtx,
-			StopCtx:   runner.StoppedCtx,
-			Verbose:   runner.Verbose,
-			Render:    runner.View,
-			VariableCache: &hcltest.VariableCache{
-
-				// TODO(liamcervante): Do the variables in the EvalContextTransformer
-				// as well as the run blocks.
-
-				ExternalVariableValues:      currentGlobalVariables,
-				TestFileVariableDefinitions: file.Config.VariableDefinitions,
-				TestFileVariableExpressions: file.Config.Variables,
-			},
+			Config:            runner.Config,
+			CancelCtx:         runner.CancelledCtx,
+			StopCtx:           runner.StoppedCtx,
+			Verbose:           runner.Verbose,
+			Render:            runner.View,
+			UnparsedVariables: currentGlobalVariables,
+			Concurrency:       runner.Concurrency,
 		})
 
 		fileRunner := &TestFileRunner{
@@ -251,8 +240,8 @@ func (runner *TestFileRunner) Test(file *moduletest.File) {
 
 	// Build the graph for the file.
 	b := graph.TestGraphBuilder{
+		Config:      runner.Suite.Config,
 		File:        file,
-		GlobalVars:  runner.EvalContext.VariableCache.ExternalVariableValues,
 		ContextOpts: runner.Suite.Opts,
 	}
 	g, diags := b.Build()
@@ -262,7 +251,7 @@ func (runner *TestFileRunner) Test(file *moduletest.File) {
 	}
 
 	// walk and execute the graph
-	diags = diags.Append(runner.walkGraph(g))
+	diags = diags.Append(graph.Walk(g, runner.EvalContext))
 
 	// If the graph walk was terminated, we don't want to add the diagnostics.
 	// The error the user receives will just be:
@@ -275,52 +264,6 @@ func (runner *TestFileRunner) Test(file *moduletest.File) {
 	}
 
 	file.Diagnostics = file.Diagnostics.Append(diags)
-}
-
-// walkGraph goes through the graph and execute each run it finds.
-func (runner *TestFileRunner) walkGraph(g *terraform.Graph) tfdiags.Diagnostics {
-	sem := runner.Suite.semaphore
-
-	// Walk the graph.
-	walkFn := func(v dag.Vertex) tfdiags.Diagnostics {
-		if runner.EvalContext.Cancelled() {
-			// If the graph walk has been cancelled, the node should just return immediately.
-			// For now, this means a hard stop has been requested, in this case we don't
-			// even stop to mark future test runs as having been skipped. They'll
-			// just show up as pending in the printed summary. We will quickly
-			// just mark the overall file status has having errored to indicate
-			// it was interrupted.
-			return nil
-		}
-
-		// the walkFn is called asynchronously, and needs to be recovered
-		// separately in the case of a panic.
-		defer logging.PanicHandler()
-
-		log.Printf("[TRACE] vertex %q: starting visit (%T)", dag.VertexName(v), v)
-
-		defer func() {
-			if r := recover(); r != nil {
-				// If the walkFn panics, we get confusing logs about how the
-				// visit was complete. To stop this, we'll catch the panic log
-				// that the vertex panicked without finishing and re-panic.
-				log.Printf("[ERROR] vertex %q panicked", dag.VertexName(v))
-				panic(r) // re-panic
-			}
-			log.Printf("[TRACE] vertex %q: visit complete", dag.VertexName(v))
-		}()
-
-		// Acquire a lock on the semaphore
-		sem.Acquire()
-		defer sem.Release()
-
-		if executable, ok := v.(graph.GraphNodeExecutable); ok {
-			executable.Execute(runner.EvalContext)
-		}
-		return nil
-	}
-
-	return g.AcyclicGraph.Walk(walkFn)
 }
 
 func (runner *TestFileRunner) renderPreWalkDiags(file *moduletest.File) (walkCancelled bool) {
